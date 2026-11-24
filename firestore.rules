@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signed() { return request.auth != null; }
+    function me() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+    function ex(id) { return get(/databases/$(db)/documents/exams/$(id)).data; }
+    function isParent() { return signed() && me().role == 'parent' && me().status == 'active'; }
+    function isKid(sid) { return exists(/databases/$(db)/documents/kids/$(request.auth.uid + '_' + sid)); }
+    function isAdmin() { return signed() && me().role == 'admin'; }
+    function isTeacher() { return signed() && me().role == 'teacher' && me().status == 'active'; }
+    function isStudent() { return signed() && me().role == 'student' && me().status == 'active'; }
+
+    match /users/{uid} {
+      // كل مستخدم يقرأ بياناته، الأدمن يقرأ الكل، المدرس المعتمد يقرأ الطلاب فقط (للحضور)
+      allow read: if signed() && (request.auth.uid == uid || isAdmin() || (isTeacher() && resource.data.role == 'student'));
+      allow create: if signed() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name','phone','role','status','grade'])
+        && (request.resource.data.role == 'student' ? request.resource.data.grade in ['1','2','3'] : !('grade' in request.resource.data.keys()))
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && request.resource.data.role in ['student','parent','teacher']
+        && request.resource.data.status == (request.resource.data.role == 'teacher' ? 'pending' : 'active');
+      allow update, delete: if isAdmin();
+    }
+    match /news/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    match /content/{id} {
+      allow read: if isAdmin() || isTeacher() || (isStudent() && resource.data.grade == me().grade);
+      allow create: if isTeacher()
+        && request.resource.data.keys().hasOnly(['kind','title','subject','grade','url','tid','tname','at','due'])
+        && request.resource.data.tid == request.auth.uid && request.resource.data.tname == me().name
+        && request.resource.data.kind in ['lesson','video','assignment']
+        && request.resource.data.grade in ['1','2','3']
+        && request.resource.data.title is string && request.resource.data.title.size() <= 100
+        && request.resource.data.subject is string && request.resource.data.subject.size() <= 30
+        && request.resource.data.url is string && request.resource.data.url.matches('^https://.{1,480}$')
+        && request.resource.data.at == request.time;
+      allow delete: if isAdmin() || (isTeacher() && resource.data.tid == request.auth.uid);
+    }
+
+    // الامتحانات: الأسئلة بدون إجابات
+    match /exams/{id} {
+      allow read: if isAdmin() || isTeacher() || (isStudent() && resource.data.grade == me().grade) || (isParent() && request.time > resource.data.closeAt);
+      allow create: if isTeacher()
+        && request.resource.data.keys().hasOnly(['title','subject','grade','mins','closeAt','qs','tid','tname','at'])
+        && request.resource.data.tid == request.auth.uid && request.resource.data.tname == me().name
+        && request.resource.data.grade in ['1','2','3']
+        && request.resource.data.title is string && request.resource.data.title.size() <= 100
+        && request.resource.data.subject is string && request.resource.data.subject.size() <= 30
+        && request.resource.data.mins is int && request.resource.data.mins >= 1 && request.resource.data.mins <= 180
+        && request.resource.data.closeAt is timestamp && request.resource.data.closeAt > request.time
+        && request.resource.data.qs is list && request.resource.data.qs.size() >= 1 && request.resource.data.qs.size() <= 50
+        && request.resource.data.at == request.time;
+      allow delete: if isAdmin() || (isTeacher() && resource.data.tid == request.auth.uid);
+    }
+    // مفتاح الإجابات: المدرس صاحبه دائمًا، والطالب بعد انتهاء موعد الامتحان فقط
+    match /keys/{id} {
+      allow read: if isAdmin() || (isTeacher() && resource.data.tid == request.auth.uid)
+        || (isStudent() && me().grade == ex(id).grade && request.time > ex(id).closeAt)
+        || (isParent() && request.time > ex(id).closeAt);
+      allow create: if isTeacher() && request.resource.data.keys().hasOnly(['tid','a'])
+        && request.resource.data.tid == request.auth.uid
+        && request.resource.data.a is list && request.resource.data.a.size() <= 50;
+      allow delete: if isAdmin() || (isTeacher() && resource.data.tid == request.auth.uid);
+    }
+    // التسليمات: إنشاء مرة واحدة فقط، قبل الموعد، ولا تعديل ولا حذف (الدرجة تُحسب ولا تُخزَّن فمستحيل تتزور)
+    match /subs/{subId} {
+      allow read: if isAdmin() || (signed() && (resource.data.sid == request.auth.uid || resource.data.tid == request.auth.uid || isKid(resource.data.sid)));
+      allow create: if isStudent()
+        && request.resource.data.keys().hasOnly(['eid','tid','sid','sname','grade','a','at'])
+        && request.resource.data.sid == request.auth.uid && subId == request.resource.data.eid + '_' + request.auth.uid
+        && request.resource.data.sname == me().name && request.resource.data.grade == me().grade
+        && request.resource.data.at == request.time
+        && exists(/databases/$(db)/documents/exams/$(request.resource.data.eid))
+        && ex(request.resource.data.eid).grade == me().grade
+        && ex(request.resource.data.eid).tid == request.resource.data.tid
+        && request.time < ex(request.resource.data.eid).closeAt
+        && request.resource.data.a is list && request.resource.data.a.size() == ex(request.resource.data.eid).qs.size();
+    }
+    // الحضور: يسجله مدرس معتمد لطالب حقيقي، والطالب يقرأ حضوره فقط
+    match /att/{aid} {
+      allow read: if isAdmin() || (isTeacher() && resource.data.tid == request.auth.uid) || (signed() && resource.data.sid == request.auth.uid) || (signed() && isKid(resource.data.sid));
+      allow create, update: if isTeacher()
+        && request.resource.data.keys().hasOnly(['sid','sname','grade','date','st','tid'])
+        && request.resource.data.tid == request.auth.uid
+        && request.resource.data.st in ['p','a']
+        && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && aid == request.resource.data.date + '_' + request.resource.data.sid
+        && get(/databases/$(db)/documents/users/$(request.resource.data.sid)).data.role == 'student'
+        && (request.method == 'create' || resource.data.tid == request.auth.uid);
+    }
+    // كود الربط: الطالب ينشئه (صالح 7 أيام)، الولي يقرأه بالكود فقط (get بدون list فمستحيل التخمين بالتصفح)
+    match /links/{code} {
+      allow get: if isParent() || (signed() && resource.data.sid == request.auth.uid);
+      allow list: if signed() && resource.data.sid == request.auth.uid;
+      allow create: if isStudent() && request.resource.data.keys().hasOnly(['sid','sname','grade','exp'])
+        && request.resource.data.sid == request.auth.uid && request.resource.data.sname == me().name && request.resource.data.grade == me().grade
+        && code.size() == 10 && request.resource.data.exp is timestamp
+        && request.resource.data.exp > request.time && request.resource.data.exp < request.time + duration.value(8, 'd');
+      allow delete: if signed() && resource.data.sid == request.auth.uid;
+    }
+    // الربط: الولي ينشئه بكود صحيح وغير منتهي، وأي طرف (ولي أو طالب) يقدر يفكه
+    match /kids/{kid} {
+      allow read: if isAdmin() || (signed() && (resource.data.pid == request.auth.uid || resource.data.sid == request.auth.uid));
+      allow create: if isParent() && request.resource.data.keys().hasOnly(['pid','pname','sid','sname','grade','code'])
+        && request.resource.data.pid == request.auth.uid && request.resource.data.pname == me().name
+        && kid == request.auth.uid + '_' + request.resource.data.sid
+        && get(/databases/$(db)/documents/links/$(request.resource.data.code)).data.sid == request.resource.data.sid
+        && get(/databases/$(db)/documents/links/$(request.resource.data.code)).data.sname == request.resource.data.sname
+        && get(/databases/$(db)/documents/links/$(request.resource.data.code)).data.grade == request.resource.data.grade
+        && request.time < get(/databases/$(db)/documents/links/$(request.resource.data.code)).data.exp;
+      allow delete: if signed() && (resource.data.pid == request.auth.uid || resource.data.sid == request.auth.uid);
+    }
+    // الإشعارات: المدرس والأدمن يرسلوا، كل فئة تقرأ ما وُجّه لها فقط
+    match /msgs/{id} {
+      allow read: if isAdmin() || (isTeacher() && resource.data.by == request.auth.uid)
+        || (isStudent() && resource.data.aud in ['all','students',me().grade])
+        || (isParent() && resource.data.aud in ['all','parents']);
+      allow create: if (isTeacher() || isAdmin()) && request.resource.data.keys().hasOnly(['title','text','aud','by','bname','at'])
+        && request.resource.data.by == request.auth.uid && request.resource.data.bname == me().name
+        && request.resource.data.aud in ['all','students','parents','1','2','3']
+        && request.resource.data.title is string && request.resource.data.title.size() <= 100
+        && request.resource.data.text is string && request.resource.data.text.size() <= 1000
+        && request.resource.data.at == request.time;
+      allow delete: if isAdmin() || resource.data.by == request.auth.uid;
+    }
+    match /{path=**} { allow read, write: if false; }
+  }
+}
